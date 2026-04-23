@@ -1,0 +1,144 @@
+# Import libraries
+import os
+import pandas as pd
+import torch
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from deep_translator import GoogleTranslator
+
+tqdm.pandas()
+
+# File paths (update these to your own directories)
+input_file = "path/to/your/input.csv"
+output_dir = "path/to/output_folder"
+output_file = os.path.join(output_dir, "output_with_vad.csv")
+
+os.makedirs(output_dir, exist_ok=True)
+
+# Whether to translate non-English text before prediction
+translate_non_english = True
+
+# Load dataset
+df = pd.read_csv(input_file)
+
+# Check required columns
+required_cols = ["Transcript", "Language"]
+missing_cols = [col for col in required_cols if col not in df.columns]
+if missing_cols:
+    raise ValueError(f"Missing required columns: {missing_cols}")
+
+# Load VAD model
+model_name = "RobroKools/vad-bert"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name)
+model.eval()
+
+# Use GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+print(f"Using device: {device}")
+
+# Translator setup
+translator = GoogleTranslator(source="auto", target="en")
+
+def safe_translate(text):
+    """Translate non-English text to English; return original if failed."""
+    if pd.isna(text):
+        return ""
+    
+    text = str(text).strip()
+    if text == "":
+        return ""
+    
+    try:
+        return translator.translate(text)
+    except Exception:
+        return text
+
+# Text cleaning
+def clean_text(text):
+    if pd.isna(text):
+        return ""
+    text = str(text).strip()
+    if text.lower() == "nan":
+        return ""
+    return text
+
+# Prepare text for VAD model
+def get_text_for_vad(row):
+    text = clean_text(row["Transcript"])
+    lang = str(row["Language"]).strip() if not pd.isna(row["Language"]) else ""
+    
+    if text == "":
+        return ""
+    
+    if translate_non_english and lang != "English":
+        return safe_translate(text)
+    else:
+        return text
+
+# Run VAD prediction
+def get_vad_scores(text):
+    """Return valence, arousal, dominance scores."""
+    text = clean_text(text)
+    
+    if text == "":
+        return pd.Series({
+            "valence": pd.NA,
+            "arousal": pd.NA,
+            "dominance": pd.NA
+        })
+    
+    try:
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+        
+        vad = outputs.logits.squeeze().detach().cpu().tolist()
+        
+        return pd.Series({
+            "valence": float(vad[0]),
+            "arousal": float(vad[1]),
+            "dominance": float(vad[2])
+        })
+    
+    except Exception:
+        return pd.Series({
+            "valence": pd.NA,
+            "arousal": pd.NA,
+            "dominance": pd.NA
+        })
+
+# Prepare input text
+print("Preparing text for VAD...")
+df["text_for_vad"] = df.progress_apply(get_text_for_vad, axis=1)
+
+# Apply VAD model
+print("Running VAD prediction...")
+vad_df = df["text_for_vad"].progress_apply(get_vad_scores)
+
+# Merge results
+df = pd.concat([df, vad_df], axis=1)
+
+# Drop intermediate column (optional)
+df = df.drop(columns=["text_for_vad"])
+
+# Save results
+df.to_csv(output_file, index=False)
+
+# Print summary
+print("\nDone.")
+print(f"Saved file to: {output_file}")
+print(f"Total rows: {len(df)}")
+print(f"Rows with valence: {df['valence'].notna().sum()}")
+print(f"Rows with arousal: {df['arousal'].notna().sum()}")
+print(f"Rows with dominance: {df['dominance'].notna().sum()}")
