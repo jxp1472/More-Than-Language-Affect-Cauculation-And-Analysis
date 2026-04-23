@@ -1,0 +1,7 @@
+pandas
+torch
+tqdm
+transformers
+deep-translator
+sentencepiece
+protobuf
